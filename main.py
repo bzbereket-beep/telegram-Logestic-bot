@@ -12,6 +12,8 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "logistics_bot.db")
 TZ = ZoneInfo("Africa/Addis_Ababa")
+FUEL_KM_PER_LITER = 8.0
+FUEL_PRICE_PER_LITER = 185.0
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("logsti")
 
@@ -97,6 +99,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example: /fare 7 150\n\n"
         "/expense AMOUNT DESCRIPTION\n"
         "Example: /expense 1500 Fuel\n\n"
+        "/fuelkm KM - estimate daily fuel use and cost\n"
+        "Example: /fuelkm 150\n\n"
         "/status - current trip totals and unpaid passengers\n"
         "/close - close the current trip\n"
         "/today - today's totals\n"
@@ -209,6 +213,30 @@ def trip_totals(db, trip_id):
     costs = db.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE trip_id=?", (trip_id,)).fetchone()[0]
     return expected, paid_total, costs
 
+async def fuelkm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("Use: /fuelkm KM\\nExample: /fuelkm 150")
+        return
+    try:
+        km = float(context.args[0])
+        if km <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("Please enter a positive distance in kilometers.")
+        return
+    liters = km / FUEL_KM_PER_LITER
+    cost = liters * FUEL_PRICE_PER_LITER
+    await update.message.reply_text(
+        f"DAILY FUEL ESTIMATE\\nDistance: {km:g} km\\n"
+        f"Fuel efficiency: {FUEL_KM_PER_LITER:g} km/liter\\n"
+        f"Estimated fuel used: {liters:.2f} liters\\n"
+        f"Fuel price: {money(FUEL_PRICE_PER_LITER)} birr/liter\\n"
+        f"Estimated fuel cost: {money(cost)} birr\\n"
+        f"Cost per kilometer: {money(FUEL_PRICE_PER_LITER / FUEL_KM_PER_LITER)} birr/km\\n\\n"
+        "This is an estimate based on your standard 8 km/liter rate."
+    )
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with connect() as db:
         trip = active_trip(db, update.effective_chat.id)
@@ -304,6 +332,7 @@ def main():
     app.add_handler(CommandHandler("paid", paid))
     app.add_handler(CommandHandler("fare", fare))
     app.add_handler(CommandHandler("expense", expense))
+    app.add_handler(CommandHandler("fuelkm", fuelkm))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("close", close_trip))
     app.add_handler(CommandHandler("today", today_cmd))

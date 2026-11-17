@@ -19,7 +19,7 @@ log = logging.getLogger("logsti")
 
 MENU = ReplyKeyboardMarkup(
     [["New trip", "Trip status"], ["Record payment", "Add expense"],
-     ["Today report", "Month report"], ["Close trip", "Help"]],
+     ["Today report", "Month report"], ["Fuel cost", "Close trip"], ["Help"]],
     resize_keyboard=True
 )
 
@@ -70,6 +70,15 @@ def init_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY(trip_id) REFERENCES trips(id)
         );
+        CREATE TABLE IF NOT EXISTS fuel_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            log_date TEXT NOT NULL,
+            km REAL NOT NULL,
+            liters REAL NOT NULL,
+            cost REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """)
         db.commit()
 
@@ -99,7 +108,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example: /fare 7 150\n\n"
         "/expense AMOUNT DESCRIPTION\n"
         "Example: /expense 1500 Fuel\n\n"
-        "/fuelkm KM - estimate daily fuel use and cost\n"
+        "/fuelkm KM - save daily distance and calculate fuel cost\n"
         "Example: /fuelkm 150\n\n"
         "/status - current trip totals and unpaid passengers\n"
         "/close - close the current trip\n"
@@ -226,14 +235,24 @@ async def fuelkm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     liters = km / FUEL_KM_PER_LITER
     cost = liters * FUEL_PRICE_PER_LITER
+    chat_id = update.effective_chat.id
+    log_date = datetime.now(TZ).date().isoformat()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO fuel_logs(chat_id,log_date,km,liters,cost,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, log_date, km, liters, cost, now())
+        )
+        db.commit()
+        totals = db.execute(
+            "SELECT COALESCE(SUM(km),0),COALESCE(SUM(liters),0),COALESCE(SUM(cost),0) FROM fuel_logs WHERE chat_id=? AND log_date=?",
+            (chat_id, log_date)
+        ).fetchone()
     await update.message.reply_text(
-        f"DAILY FUEL ESTIMATE\\nDistance: {km:g} km\\n"
-        f"Fuel efficiency: {FUEL_KM_PER_LITER:g} km/liter\\n"
-        f"Estimated fuel used: {liters:.2f} liters\\n"
-        f"Fuel price: {money(FUEL_PRICE_PER_LITER)} birr/liter\\n"
-        f"Estimated fuel cost: {money(cost)} birr\\n"
-        f"Cost per kilometer: {money(FUEL_PRICE_PER_LITER / FUEL_KM_PER_LITER)} birr/km\\n\\n"
-        "This is an estimate based on your standard 8 km/liter rate."
+        f"FUEL ENTRY SAVED\\nDistance entered: {km:g} km\\n"
+        f"Fuel used: {liters:.2f} liters\\nEstimated cost: {money(cost)} birr\\n\\n"
+        f"TODAY'S TOTAL\\nDistance: {totals[0]:g} km\\n"
+        f"Fuel used: {totals[1]:.2f} liters\\nFuel cost: {money(totals[2])} birr\\n\\n"
+        f"Based on {FUEL_KM_PER_LITER:g} km/liter and {money(FUEL_PRICE_PER_LITER)} birr/liter."
     )
 
 
@@ -277,22 +296,32 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str
     with connect() as db:
         if period == "today":
             clause, value = "date(created_at)=?", today
+            fuel_clause, fuel_value = "log_date=?", today
             title = f"TODAY'S REPORT ({today})"
         else:
             clause, value = "substr(created_at,1,7)=?", month
+            fuel_clause, fuel_value = "substr(log_date,1,7)=?", month
             title = f"MONTH REPORT ({month})"
         trips = db.execute(f"SELECT id,trip_no FROM trips WHERE chat_id=? AND {clause}", (chat_id,value)).fetchall()
         ids = [t["id"] for t in trips]
-        if not ids:
-            await update.message.reply_text(title + "\\nNo trips recorded for this period.")
-            return
-        marks = ",".join("?" for _ in ids)
-        expected = db.execute(f"SELECT COALESCE(SUM(expected),0) FROM fares WHERE trip_id IN ({marks})", ids).fetchone()[0]
-        income = db.execute(f"SELECT COALESCE(SUM(amount),0) FROM payments WHERE trip_id IN ({marks})", ids).fetchone()[0]
-        costs = db.execute(f"SELECT COALESCE(SUM(amount),0) FROM expenses WHERE trip_id IN ({marks})", ids).fetchone()[0]
+        expected = income = costs = 0
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            expected = db.execute(f"SELECT COALESCE(SUM(expected),0) FROM fares WHERE trip_id IN ({marks})", ids).fetchone()[0]
+            income = db.execute(f"SELECT COALESCE(SUM(amount),0) FROM payments WHERE trip_id IN ({marks})", ids).fetchone()[0]
+            costs = db.execute(f"SELECT COALESCE(SUM(amount),0) FROM expenses WHERE trip_id IN ({marks})", ids).fetchone()[0]
+        fuel = db.execute(
+            f"SELECT COALESCE(SUM(km),0),COALESCE(SUM(liters),0),COALESCE(SUM(cost),0) FROM fuel_logs WHERE chat_id=? AND {fuel_clause}",
+            (chat_id, fuel_value)
+        ).fetchone()
     await update.message.reply_text(
-        f"{title}\\nTrips: {len(trips)}\\nExpected fares: {money(expected)} birr\\nPayments recorded: {money(income)} birr\\nOutstanding: {money(max(0,expected-income))} birr\\nExpenses: {money(costs)} birr\\nNet recorded cash: {money(income-costs)} birr"
+        f"{title}\\nTrips: {len(trips)}\\nExpected fares: {money(expected)} birr\\n"
+        f"Payments recorded: {money(income)} birr\\nOutstanding: {money(max(0,expected-income))} birr\\n"
+        f"Other expenses: {money(costs)} birr\\nFuel distance: {fuel[0]:g} km\\n"
+        f"Estimated fuel used: {fuel[1]:.2f} liters\\nFuel cost: {money(fuel[2])} birr\\n"
+        f"Net recorded cash after expenses and fuel: {money(income-costs-fuel[2])} birr"
     )
+
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await report(update, context, "today")

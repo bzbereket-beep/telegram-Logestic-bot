@@ -1,9 +1,11 @@
 import os
+import asyncio
 import sqlite3
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import anthropic
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -414,12 +416,38 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("I did not understand. Tap Help to see examples.", reply_markup=MENU)
 
+async def ask_claude(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = " ".join(context.args).strip()
+    if not question:
+        await update.message.reply_text("Ask Claude like this: /ask How can I improve my daily trip income?")
+        return
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        await update.message.reply_text("Claude is not configured yet. Add ANTHROPIC_API_KEY in Railway Variables.")
+        return
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-haiku-5-5",
+            max_tokens=700,
+            system="You are a helpful assistant inside a passenger logistics business Telegram bot. Help with trip planning, record-keeping guidance, and general questions. Never claim to verify bank payments; only the user can verify those in their banking app.",
+            messages=[{"role": "user", "content": question}],
+        )
+        answer = "\n".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+        await update.message.reply_text(answer[:4000] or "Claude returned an empty response.")
+    except Exception:
+        log.exception("Claude API request failed")
+        await update.message.reply_text("I could not reach Claude. Please check the Railway deployment logs and API key.")
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your hosting environment.")
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ask", ask_claude))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("newtrip", newtrip))
     app.add_handler(CommandHandler("paid", paid))

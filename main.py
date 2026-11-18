@@ -12,14 +12,14 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "logistics_bot.db")
 TZ = ZoneInfo("Africa/Addis_Ababa")
-FUEL_KM_PER_LITER = 8.0
-FUEL_PRICE_PER_LITER = 185.0
+FUEL_KM_PER_LITER = float(os.getenv("FUEL_KM_PER_LITER", "8.0"))
+FUEL_PRICE_PER_LITER = float(os.getenv("FUEL_PRICE_PER_LITER", "185.0"))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("logsti")
 
 MENU = ReplyKeyboardMarkup(
     [["New trip", "Trip status"], ["Record payment", "Add expense"],
-     ["Today report", "Month report"], ["Fuel cost", "Close trip"], ["Help"]],
+     ["Today report", "Month report"], ["Fuel cost", "Close trip"], ["Verify payment", "Unverified"], ["Help"]],
     resize_keyboard=True
 )
 
@@ -173,6 +173,66 @@ async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Recorded: passenger {passenger} paid {money(amount)} birr by {method}.\\nPayment status: NOT VERIFIED\\nTotal recorded payments this trip: {money(total)} birr.\\nCheck your payment app before treating it as verified."
     )
+
+
+async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Use: /verify PASSENGER [AMOUNT]\nExample: /verify 7 600")
+        return
+    passenger = context.args[0]
+    amount = None
+    if len(context.args) > 1:
+        try:
+            amount = float(context.args[1])
+        except ValueError:
+            await update.message.reply_text("Amount must be a number.")
+            return
+    with connect() as db:
+        trip = active_trip(db, update.effective_chat.id)
+        if not trip:
+            await update.message.reply_text("No open trip.")
+            return
+        if amount is None:
+            row = db.execute(
+                "SELECT id,amount,method FROM payments WHERE trip_id=? AND passenger=? AND verified=0 "
+                "ORDER BY id DESC LIMIT 1",
+                (trip["id"], passenger),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT id,amount,method FROM payments WHERE trip_id=? AND passenger=? AND amount=? AND verified=0 "
+                "ORDER BY id DESC LIMIT 1",
+                (trip["id"], passenger, amount),
+            ).fetchone()
+        if not row:
+            await update.message.reply_text("No matching unverified payment found.")
+            return
+        db.execute("UPDATE payments SET verified=1 WHERE id=?", (row["id"],))
+        db.commit()
+    await update.message.reply_text(
+        f"Verified: passenger {passenger} paid {money(row['amount'])} birr by {row['method']}."
+    )
+
+async def unverified(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with connect() as db:
+        trip = active_trip(db, update.effective_chat.id)
+        if not trip:
+            await update.message.reply_text("No open trip.")
+            return
+        rows = db.execute(
+            "SELECT passenger,amount,method FROM payments "
+            "WHERE trip_id=? AND verified=0 ORDER BY id",
+            (trip["id"],),
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("All recorded payments are verified.")
+        return
+    lines = ["UNVERIFIED PAYMENTS"]
+    for row in rows:
+        lines.append(
+            f"Passenger {row['passenger']}: {money(row['amount'])} birr ({row['method']})"
+        )
+    await update.message.reply_text("\n".join(lines))
 
 async def fare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
@@ -345,6 +405,10 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await month_cmd(update, context)
     elif text == "close trip":
         await close_trip(update, context)
+    elif text == "verify payment":
+        await update.message.reply_text("After checking your payment app: /verify PASSENGER [AMOUNT]\nExample: /verify 7 600")
+    elif text == "unverified":
+        await unverified(update, context)
     elif text == "help":
         await help_cmd(update, context)
     else:
@@ -359,6 +423,8 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("newtrip", newtrip))
     app.add_handler(CommandHandler("paid", paid))
+    app.add_handler(CommandHandler("verify", verify))
+    app.add_handler(CommandHandler("unverified", unverified))
     app.add_handler(CommandHandler("fare", fare))
     app.add_handler(CommandHandler("expense", expense))
     app.add_handler(CommandHandler("fuelkm", fuelkm))
